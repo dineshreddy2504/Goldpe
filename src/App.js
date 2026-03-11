@@ -28,10 +28,14 @@ try {
 const res = await fetch("http://127.0.0.1:8000/gold-price");
 const data = await res.json();
 
+const k24 = Number(data["24k"] ?? data.price ?? 0);
+const k22 = Number(data["22k"] ?? (k24 > 0 ? k24 * 0.92 : 0));
+const k18 = Number(data["18k"] ?? (k24 > 0 ? k24 * 0.75 : 0));
+
 setGoldPrice({
-k24: data["24k"],
-k22: data["22k"],
-k18: data["18k"]
+k24,
+k22,
+k18
 });
 
 } catch (error) {
@@ -73,7 +77,7 @@ return () => clearInterval(interval);
 
 const buyGold = async () => {
 
-if (!name || !phone || !amount) {
+if (!name.trim() || !phone.trim() || Number(amount) <= 0) {
 alert("Please fill all fields");
 return;
 }
@@ -82,8 +86,9 @@ const orderId = "ORD" + Math.floor(Math.random() * 1000000);
 const invoiceId = "INV" + Math.floor(Math.random() * 1000000);
 const clientReferenceId = "REF" + Math.floor(Math.random() * 1000000);
 
-const gst = amount * 0.03;
-const total = Number(amount) + gst;
+const numericAmount = Number(amount);
+const gst = numericAmount * 0.03;
+const total = numericAmount + gst;
 
 const transaction = {
 
@@ -102,7 +107,7 @@ created_at: new Date().toISOString()
 
 try {
 
-await fetch("http://127.0.0.1:8000/transaction", {
+const response = await fetch("http://127.0.0.1:8000/transaction", {
 
 method: "POST",
 headers: { "Content-Type": "application/json" },
@@ -110,11 +115,15 @@ body: JSON.stringify(transaction)
 
 });
 
+if (!response.ok) {
+throw new Error("Unable to save transaction");
+}
+
 setInvoice({
 orderId,
 invoiceId,
 gold: goldWeight.toFixed(4),
-amount: amount,
+amount: numericAmount,
 gst: gst.toFixed(2),
 total: total.toFixed(2)
 });
