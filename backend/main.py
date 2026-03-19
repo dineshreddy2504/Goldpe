@@ -8,28 +8,63 @@ from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 import razorpay
+import logging
 
-# Load env
+# ----------------------------
+# Logging
+# ----------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ----------------------------
+# Load Environment Variables
+# ----------------------------
+
 load_dotenv()
 
-app = FastAPI()
-
-# Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 GOLDAPI_API_KEY = os.getenv("GOLDAPI_API_KEY")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_SECRET = os.getenv("RAZORPAY_SECRET")
 
-# Razorpay client
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL not set")
+
+if not RAZORPAY_KEY_ID or not RAZORPAY_SECRET:
+    raise Exception("Razorpay credentials not set in environment")
+
+# ----------------------------
+# FastAPI App
+# ----------------------------
+
+app = FastAPI()
+
+# ----------------------------
+# Razorpay Client
+# ----------------------------
+
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_SECRET))
 
-# Database setup
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# ----------------------------
+# Database Setup
+# ----------------------------
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30
+)
+
 SessionLocal = sessionmaker(bind=engine)
 
 Base = declarative_base()
 
+# ----------------------------
 # Gold API
+# ----------------------------
+
 GOLDAPI_URL = "https://www.goldapi.io/api/XAU/INR"
 
 LAST_KNOWN_PRICES = {
@@ -38,41 +73,52 @@ LAST_KNOWN_PRICES = {
     "18k": 4500.0
 }
 
+# ----------------------------
 # Database Tables
+# ----------------------------
+
 class Transaction(Base):
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String)
-    phone_no = Column(String)
-    rate_id = Column(String)
-    gold_amount = Column(Float)
-    buy_price = Column(Float)
-    client_reference_id = Column(String)
-    order_id = Column(String)
-    invoice_id = Column(String)
-    status = Column(Integer)
-    created_at = Column(String)
+    name = Column(String(255), nullable=False)
+    phone_no = Column(String(20), nullable=False)
+    rate_id = Column(String(50), nullable=False)
+    gold_amount = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    client_reference_id = Column(String(100))
+    order_id = Column(String(100))
+    invoice_id = Column(String(100))
+    status = Column(Integer, default=0)
+    created_at = Column(String(50))
+
 
 class UserBalance(Base):
     __tablename__ = "user_balances"
 
     id = Column(Integer, primary_key=True, index=True)
-    phone_no = Column(String, unique=True)
+    phone_no = Column(String(20), unique=True, nullable=False, index=True)
     gold_balance = Column(Float, default=0)
+
 
 Base.metadata.create_all(bind=engine)
 
-# CORS (for React)
+# ----------------------------
+# CORS
+# ----------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=True,#Remove *
+    allow_methods=["*"], 
     allow_headers=["*"],
 )
 
+# ----------------------------
 # Request Models
+# ----------------------------
+
 class TransactionCreate(BaseModel):
     name: str
     phone_no: str
@@ -85,15 +131,20 @@ class TransactionCreate(BaseModel):
     status: int
     created_at: str
 
+
 class OrderCreate(BaseModel):
     amount: float
+
 
 class VerifyPayment(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
 
+# ----------------------------
 # Gold Price API
+# ----------------------------
+
 @app.get("/gold-price")
 def get_gold_price():
 
@@ -130,53 +181,65 @@ def get_gold_price():
         if price_18k > 0:
             LAST_KNOWN_PRICES["18k"] = round(price_18k, 2)
 
-        return {
-            "24k": LAST_KNOWN_PRICES["24k"],
-            "22k": LAST_KNOWN_PRICES["22k"],
-            "18k": LAST_KNOWN_PRICES["18k"],
-            "source": "goldapi",
-        }
+        return LAST_KNOWN_PRICES
 
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Gold API failed, using fallback: {str(e)}")
+        return LAST_KNOWN_PRICES
 
-        return {
-            "24k": LAST_KNOWN_PRICES["24k"],
-            "22k": LAST_KNOWN_PRICES["22k"],
-            "18k": LAST_KNOWN_PRICES["18k"],
-            "source": "fallback",
-        }
-
+# ----------------------------
 # Razorpay Order Creation
+# ----------------------------
+
 @app.post("/create-order")
 def create_order(data: OrderCreate):
+    try:
+        logger.info(f"Creating order for amount: {data.amount}")
+        
+        order = razorpay_client.order.create({
+            "amount": int(data.amount * 100),
+            "currency": "INR",
+            "payment_capture": 1
+        })
+        
+        logger.info(f"Order created successfully: {order.get('id')}")
+        return order
+    
+    except Exception as e:
+        logger.error(f"Order creation failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Order creation failed: {str(e)}")
 
-    order = razorpay_client.order.create({
-        "amount": int(data.amount * 100),
-        "currency": "INR",
-        "payment_capture": 1
-    })
+# ----------------------------
+# Razorpay Payment Verification
+# ----------------------------
 
-    return order
-
-# Verify Razorpay Payment
 @app.post("/verify-payment")
 def verify_payment(data: VerifyPayment):
-
     try:
-
+        logger.info(f"Verifying payment: {data.razorpay_payment_id}")
+        
         razorpay_client.utility.verify_payment_signature({
             "razorpay_order_id": data.razorpay_order_id,
             "razorpay_payment_id": data.razorpay_payment_id,
             "razorpay_signature": data.razorpay_signature
         })
 
-        return {"status": "Payment verified"}
+        logger.info(f"Payment verified successfully: {data.razorpay_payment_id}")
 
-    except:
+        return {"status": "Payment verified", "success": True}
 
-        raise HTTPException(status_code=400, detail="Payment verification failed")
+    except razorpay.BadRequestsError as e:
+        logger.error(f"Razorpay BadRequestsError: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Payment verification failed: Bad request")
+    
+    except Exception as e:
+        logger.error(f"Payment verification failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
 
+# ----------------------------
 # Save Transaction
+# ----------------------------
+
 @app.post("/transaction")
 def create_transaction(data: TransactionCreate):
 
@@ -184,48 +247,44 @@ def create_transaction(data: TransactionCreate):
 
     try:
 
-        tx = Transaction(
-            name=data.name,
-            phone_no=data.phone_no,
-            rate_id=data.rate_id,
-            gold_amount=data.gold_amount,
-            buy_price=data.buy_price,
-            client_reference_id=data.client_reference_id,
-            order_id=data.order_id,
-            invoice_id=data.invoice_id,
-            status=data.status,
-            created_at=data.created_at,
-        )
-
+        tx = Transaction(**data.dict())
         db.add(tx)
-        db.commit()
+        db.flush()
 
         balance = db.query(UserBalance).filter(
             UserBalance.phone_no == data.phone_no
         ).first()
 
         if balance:
-
             balance.gold_balance += data.gold_amount
-
         else:
-
             balance = UserBalance(
                 phone_no=data.phone_no,
                 gold_balance=data.gold_amount
             )
-
             db.add(balance)
 
         db.commit()
 
-        return {"message": "Transaction saved"}
+        logger.info(f"Transaction saved for {data.phone_no}")
+
+        return {"message": "Transaction saved", "success": True}
+
+    except Exception as e:
+
+        db.rollback()
+
+        logger.error(f"Transaction failed: {str(e)}")
+
+        raise HTTPException(status_code=500, detail="Database error")
 
     finally:
-
         db.close()
 
+# ----------------------------
 # Get Transactions
+# ----------------------------
+
 @app.get("/transactions")
 def get_transactions():
 
@@ -235,26 +294,15 @@ def get_transactions():
 
         txs = db.query(Transaction).all()
 
-        return [
-
-            {
-                "name": t.name,
-                "phone_no": t.phone_no,
-                "gold_amount": t.gold_amount,
-                "buy_price": t.buy_price,
-                "order_id": t.order_id,
-                "invoice_id": t.invoice_id,
-                "status": t.status,
-            }
-
-            for t in txs
-        ]
+        return txs
 
     finally:
-
         db.close()
 
-# Get User Gold Balance
+# ----------------------------
+# Get Balance
+# ----------------------------
+
 @app.get("/balance/{phone}")
 def get_balance(phone: str):
 
@@ -267,11 +315,9 @@ def get_balance(phone: str):
         ).first()
 
         if balance:
-
             return {"gold_balance": balance.gold_balance}
 
         return {"gold_balance": 0}
 
     finally:
-
         db.close()
